@@ -1,10 +1,12 @@
 #include "include/WinTypes.h"
 #include "include/ftd2xx.h"
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 typedef enum {
@@ -15,6 +17,51 @@ typedef enum {
   DATATYPE_HEARTBEAT = 0x05,
   DATATYPE_RDBPACKET = 0x06
 } USBDataType;
+
+#define SHM_NAME "/sm64x"
+#define SIZE 8096
+
+char *shm;
+
+int setUpSharedMem() {
+
+  int shm_fd;
+
+  // Create (or open) a shared memory object.
+  shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+  if (shm_fd == -1) {
+    perror("shm_open");
+    exit(EXIT_FAILURE);
+  }
+
+  // Set the size of the shared memory object.
+  if (ftruncate(shm_fd, SIZE) == -1) {
+    perror("ftruncate");
+    exit(EXIT_FAILURE);
+  }
+
+  // Map the shared memory object into the process's address space.
+  shm = mmap(0, SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+  if (shm == MAP_FAILED) {
+    perror("mmap");
+    exit(EXIT_FAILURE);
+  }
+
+  memset(shm, 0, SIZE);
+
+  // strcpy(shm, "start");
+
+  // Cleanup: Unmap and unlink shared memory.
+  // munmap(ptr, SIZE);
+  // shm_unlink(SHM_NAME);
+
+  return 0;
+}
+
+uint32_t swap_endian(uint32_t val) {
+  return ((val << 24)) | ((val << 8) & 0x00ff0000) | ((val >> 8) & 0x0000ff00) |
+         ((val >> 24));
+}
 
 void freeMods() {
   if (system("sudo rmmod ftdi_sio") != 0) {
@@ -69,41 +116,43 @@ int openDevice(FT_HANDLE *handle) {
 }
 
 int readData(FT_HANDLE *handle) {
-  int bytesLeft = 0;
-  uint8_t buffer[4] = {0};
-  uint32_t size = 4;
-  uint32_t bytesRead = 0;
+  int bytesInQueue = 0;
+  char buffer[(16 * 4)];
+  uint32_t size = sizeof(buffer);
+  uint32_t bytesRead = 0, totalRead = 0;
 
-  if (FT_GetQueueStatus(*handle, (LPDWORD)&bytesLeft) != FT_OK) {
-    printf("Err getting queue stat\n");
+  // Check queue status
+  if (FT_GetQueueStatus(*handle, (LPDWORD)&bytesInQueue) != FT_OK) {
+    printf("Error getting queue status\n");
     return 1;
   }
 
-  if (bytesLeft < 4) {
-    printf("Err wrong byte count in queue: %d: \n", bytesLeft);
-    // return 1;
-  }
-
-  if (FT_Read(*handle, (LPVOID)buffer, size, (LPDWORD)&bytesRead) != FT_OK) {
-    printf("Err FT_READ()\n");
+  if (bytesInQueue == 0) {
     return 1;
   }
 
-  if (bytesRead == 4) {
- //   printf("Data recieved:\n");
- //   printf("%d\n", buffer[0]);
- ////   printf("%d\n", buffer[1]);
- //   printf("%d\n", buffer[2]);
- //   printf("%d\n", buffer[3]);
+  FT_STATUS status = FT_Read(*handle, (LPVOID)(buffer + totalRead), bytesInQueue,
+                             (LPDWORD)&bytesRead);
+
+
+  if (status != FT_OK) {
+    printf("FT_READ status err");
+    return 1;
+  }
+
+  if (bytesRead < bytesInQueue){
+    printf("Read bytes < queue bytes");
+    return 1;
+  }
+
+  if (bytesRead > 0) {
+    memcpy(shm, buffer, bytesRead);
   }
 
   return 0;
 }
 
-uint32_t swap_endian(uint32_t val) {
-  return ((val << 24)) | ((val << 8) & 0x00ff0000) | ((val >> 8) & 0x0000ff00) |
-         ((val >> 24));
-}
+
 
 int sendData(FT_HANDLE *handle, uint8_t data[12]) {
   uint32_t headerSize = 0;
@@ -174,9 +223,11 @@ int main(void) {
   *(uint32_t *)(&data[4]) = swap_endian(DATATYPE_TEXT);
   *(uint32_t *)(&data[8]) = swap_endian(4);
 
+  setUpSharedMem();
+  
   while (1) {
     readData(&handle);
-    sendData(&handle, data);
+    // sendData(&handle, data);
     usleep(10000);
   }
 
